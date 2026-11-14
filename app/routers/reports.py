@@ -56,7 +56,7 @@ def ras(user: User = Depends(current_user), db: Session = Depends(get_db)):
 def dashboard(period: Optional[str] = None, ra_id: Optional[str] = None,
               user: User = Depends(current_user), db: Session = Depends(get_db)):
     period = period or latest_period(db)
-    conds = investor_filter(db, user, ra_id, pool=False)
+    conds = investor_filter(db, user, ra_id)  # admins: own RAs' clients + the unassigned pool
     scoped = select(Investor.id).where(*conds)
 
     def snap_totals(p):
