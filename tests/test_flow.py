@@ -52,7 +52,13 @@ def test_full_flow(api):
     ra = api.post("/users", json={"name": "RA One", "email": "r1@x.com", "password": "password1", "role": "RA"}, headers=ah).json()
     ra2 = api.post("/users", json={"name": "RA Two", "email": "r2@x.com", "password": "password1", "role": "RA"}, headers=ah2).json()
     rh = login(api, "r1@x.com", "password1")
-    assert api.get("/users", headers=rh).status_code == 403 and api.post("/uploads", files=files, headers=ah).status_code == 403
+    assert api.get("/users", headers=rh).status_code == 403 and api.post("/uploads", files=files, headers=rh).status_code == 403
+    # admins may upload too; a repeat upload adds nothing and leaves the book unchanged
+    au = api.post("/uploads", files=files, headers=ah)
+    assert au.status_code == 200 and all(r["ok"] for r in au.json())
+    assert sum(r["rows_new"] for r in au.json() if r["report_type"] != "AUM") == 0
+    assert api.get("/uploads", headers=ah).status_code == 200
+    assert round(api.get("/dashboard", headers=m).json()["totals"]["aum"]) == 66754308
 
     inv = api.get("/investors", headers=ah).json()["items"]
     assert len(inv) >= 293 and api.get("/investors", headers=rh).json()["items"] == []
