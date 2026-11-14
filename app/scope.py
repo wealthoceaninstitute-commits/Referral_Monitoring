@@ -25,7 +25,7 @@ def investor_filter(db: Session, user: User, ra_id: Optional[str] = None, pool: 
     """SQL conditions limiting Investor rows to what `user` may see.
 
     MASTER: everyone.  ADMIN: clients of their own RAs (+ the unassigned pool when `pool`).
-    RA: only their own clients.  `ra_id` narrows further: a user id or 'unassigned'.
+    RA: only their own clients.  `ra_id` narrows further: a user id, 'assigned' or 'unassigned'.
     """
     conds = []
     if user.role == RA:
@@ -37,9 +37,11 @@ def investor_filter(db: Session, user: User, ra_id: Optional[str] = None, pool: 
         if user.role == RA:
             raise HTTPException(403, "Not allowed")
         conds.append(Investor.ra_id.is_(None))
+    elif ra_id == "assigned":
+        conds.append(Investor.ra_id.is_not(None))
     elif ra_id:
         if not ra_id.isdigit():
-            raise HTTPException(422, "ra_id must be a user id or 'unassigned'")
+            raise HTTPException(422, "ra_id must be a user id, 'assigned' or 'unassigned'")
         conds.append(Investor.ra_id == int(ra_id))
     return conds
 
