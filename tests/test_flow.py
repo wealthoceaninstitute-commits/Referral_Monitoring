@@ -69,6 +69,11 @@ def test_full_flow(api):
     mine = api.get("/investors", headers=rh).json()["items"]
     assert sorted(i["id"] for i in mine) == sorted(pick)
     assert all(i["pan"] is None or "*" in i["pan"] for i in mine)
+    # admin dashboard = everything the admin can see (own RAs' clients + unassigned pool)
+    ad = api.get("/dashboard", headers=ah).json()["totals"]
+    assert ad["clients"] == len(inv) and round(ad["aum"]) == 66754308
+    team = api.get("/dashboard?ra_id=assigned", headers=ah).json()["totals"]
+    assert team["clients"] == 10 and abs(team["aum"] - sum(i["aum_total"] for i in mine)) < 1
     rd = api.get("/dashboard", headers=rh).json()
     assert rd["totals"]["clients"] == 10 and abs(rd["totals"]["aum"] - sum(i["aum_total"] for i in mine)) < 1
     assert rd["by_ra"] == []
