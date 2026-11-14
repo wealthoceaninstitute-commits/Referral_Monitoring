@@ -2,12 +2,23 @@ import os
 
 
 def _db_url() -> str:
-    url = os.environ.get("DATABASE_URL", "sqlite:///./dev.db")
+    raw = os.environ.get("DATABASE_URL")
+    url = (raw or "").strip().strip("'\"").strip()
+    if not url:
+        if raw is not None:  # variable exists but is empty -> a mistake, not "use the local default"
+            raise RuntimeError("DATABASE_URL is set but empty. In Railway set it to ${{Postgres.DATABASE_URL}} "
+                               "(use your database service's exact name).")
+        return "sqlite:///./dev.db"
+    if "${{" in url or "{{" in url:
+        raise RuntimeError("DATABASE_URL still contains an unresolved Railway reference: " + url[:60] +
+                           " - the service name inside ${{ }} must match your Postgres service exactly.")
     # Railway gives postgres:// or postgresql:// - point SQLAlchemy at psycopg 3
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
     if url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url[len("postgresql://"):]
+    if not url.startswith(("postgresql+psycopg://", "sqlite:")):
+        raise RuntimeError("DATABASE_URL must start with postgresql:// - got: " + url[:30] + "...")
     return url
 
 
