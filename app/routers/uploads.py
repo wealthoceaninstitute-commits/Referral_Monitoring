@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .. import parsers
 from ..db import get_db
 from ..ingest import ingest
-from ..models import MASTER, Upload, User
+from ..models import ADMIN, MASTER, Upload, User
 from ..security import require
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
@@ -23,7 +23,7 @@ def upload_out(u: Upload, by: Optional[str] = None) -> dict:
 
 @router.post("")
 async def upload(files: list[UploadFile] = File(...), period: Optional[str] = Form(None),
-                 actor: User = Depends(require(MASTER)), db: Session = Depends(get_db)):
+                 actor: User = Depends(require(MASTER, ADMIN)), db: Session = Depends(get_db)):
     """Accepts any mix of the four NJ reports; each file's type is detected from its title row.
     `period` (YYYY-MM) overrides the month an AUM report is filed under."""
     if period and not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
@@ -56,7 +56,7 @@ async def upload(files: list[UploadFile] = File(...), period: Optional[str] = Fo
 
 
 @router.get("")
-def history(actor: User = Depends(require(MASTER)), db: Session = Depends(get_db)):
+def history(actor: User = Depends(require(MASTER, ADMIN)), db: Session = Depends(get_db)):
     rows = db.execute(select(Upload, User.name).join(User, User.id == Upload.uploaded_by)
                       .order_by(Upload.uploaded_at.desc()).limit(200)).all()
     return [upload_out(u, by) for u, by in rows]
