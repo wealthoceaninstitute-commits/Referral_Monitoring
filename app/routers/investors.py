@@ -8,10 +8,10 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..ingest import relink
-from ..models import ADMIN, MASTER, RA, AumSnapshot, Investor, Txn, User
+from ..models import ADMIN, MASTER, RA, AumSnapshot, Investor, Registration, Txn, User
 from ..scope import investor_filter, mask_pan, visible_ras
 from ..security import current_user, require
-from .reports import latest_period, txn_out
+from .reports import latest_period, pick_as_on, txn_out
 
 router = APIRouter(prefix="/investors", tags=["investors"])
 SNAP_FIELDS = ["inv_equity", "inv_debt", "inv_hybrid", "inv_physical", "inv_others", "inv_total",
@@ -34,29 +34,37 @@ def snap_out(s: Optional[AumSnapshot]) -> dict:
 
 
 @router.get("")
-def list_investors(period: Optional[str] = None, ra_id: Optional[str] = None, q: Optional[str] = None,
+def list_investors(period: Optional[str] = None, as_on: Optional[str] = None, ra_id: Optional[str] = None,
+                   q: Optional[str] = None, status: Optional[str] = None,
                    user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """`as_on` picks the AUM snapshot, `period` the transaction month.
+    `status`: 'holding' (in that snapshot) or 'not_invested' (registered/known, no holding)."""
     period = period or latest_period(db)
+    on = pick_as_on(db, as_on)
     conds = investor_filter(db, user, ra_id)
     if q:
         like = f"%{q.strip().upper()}%"
         conds.append(or_(Investor.name_key.like(like), Investor.pan.like(like)) if user.role != RA else Investor.name_key.like(like))
+    if status == "holding":
+        conds.append(AumSnapshot.id.is_not(None))
+    elif status == "not_invested":
+        conds.append(AumSnapshot.id.is_(None))
     rows = db.execute(
         select(Investor, AumSnapshot)
-        .outerjoin(AumSnapshot, (AumSnapshot.investor_id == Investor.id) & (AumSnapshot.period == period))
-        .where(*conds).order_by(Investor.name).limit(5000)).all()
+        .outerjoin(AumSnapshot, (AumSnapshot.investor_id == Investor.id) & (AumSnapshot.as_on == on))
+        .where(*conds).order_by(Investor.name).limit(10000)).all()
     ids = [i.id for i, _ in rows]
     flows: dict[int, dict] = {}
-    if ids:
-        for iid, kind, amt in db.execute(select(Txn.investor_id, Txn.kind, func.sum(Txn.amount))
-                                         .where(Txn.period == period, Txn.investor_id.in_(ids))
-                                         .group_by(Txn.investor_id, Txn.kind)):
-            flows.setdefault(iid, {})[kind] = float(amt or 0)
+    for iid, kind, amt in db.execute(select(Txn.investor_id, Txn.kind, func.sum(Txn.amount))
+                                     .where(Txn.period == period, Txn.investor_id.is_not(None))
+                                     .group_by(Txn.investor_id, Txn.kind)):
+        flows.setdefault(iid, {})[kind] = float(amt or 0)
     ras = {u.id: u.name for u in db.scalars(select(User).where(User.role == RA))}
     namesakes = {k for k, in db.execute(select(Investor.name_key).group_by(Investor.name_key).having(func.count() > 1))}
-    return {"period": period, "items": [{
+    registered = set(db.scalars(select(Registration.investor_id).where(Registration.investor_id.is_not(None)).distinct()))
+    return {"period": period, "as_on": on, "items": [{
         "id": i.id, "name": i.name, "pan": mask_pan(i.pan, user), "ra_id": i.ra_id, "ra_name": ras.get(i.ra_id),
-        "namesake": i.name_key in namesakes, "active": s is not None, **snap_out(s),
+        "namesake": i.name_key in namesakes, "active": s is not None, "registered": i.id in registered, **snap_out(s),
         "purchases": flows.get(i.id, {}).get("PURCHASE", 0.0), "redemptions": flows.get(i.id, {}).get("REDEMPTION", 0.0),
         "rejections": flows.get(i.id, {}).get("REJECTION", 0.0)} for i, s in rows]}
 
@@ -88,19 +96,21 @@ def _get(db: Session, user: User, investor_id: int) -> Investor:
 @router.get("/{investor_id}")
 def detail(investor_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     inv = _get(db, user, investor_id)
-    snaps = list(db.scalars(select(AumSnapshot).where(AumSnapshot.investor_id == inv.id).order_by(AumSnapshot.period.desc())))
+    snaps = list(db.scalars(select(AumSnapshot).where(AumSnapshot.investor_id == inv.id).order_by(AumSnapshot.as_on.desc())))
     flows: dict[str, dict] = {}
     for p, kind, amt, n in db.execute(select(Txn.period, Txn.kind, func.sum(Txn.amount), func.count())
                                       .where(Txn.investor_id == inv.id).group_by(Txn.period, Txn.kind)):
         flows.setdefault(p, {})[kind] = {"amount": float(amt or 0), "count": n}
-    by_p = {s.period: s for s in snaps}
-    months = [{"period": p, "active": p in by_p, "as_on": by_p[p].as_on if p in by_p else None, **snap_out(by_p.get(p)),
-               **{k.lower(): flows.get(p, {}).get(k, {"amount": 0.0, "count": 0}) for k in ("PURCHASE", "REDEMPTION", "REJECTION")}}
-              for p in sorted(set(by_p) | set(flows), reverse=True)]
+    months = [{"period": p, **{k.lower(): flows[p].get(k, {"amount": 0.0, "count": 0}) for k in ("PURCHASE", "REDEMPTION", "REJECTION")}}
+              for p in sorted(flows, reverse=True)]
     txns = list(db.scalars(select(Txn).where(Txn.investor_id == inv.id).order_by(Txn.txn_date.desc(), Txn.id.desc()).limit(1000)))
+    regs = list(db.scalars(select(Registration).where(Registration.investor_id == inv.id).order_by(Registration.ref_no)))
     ra = db.get(User, inv.ra_id) if inv.ra_id else None
     return {"id": inv.id, "name": inv.name, "pan": mask_pan(inv.pan, user), "group": inv.group_name,
             "ra_id": inv.ra_id, "ra_name": ra.name if ra else None, "assigned_at": inv.assigned_at,
+            "registrations": [{"ref_no": g.ref_no, "account_type": g.account_type, "mode": g.mode,
+                               "acquired_from": g.acquired_from} for g in regs],
+            "snapshots": [{"as_on": s.as_on, **snap_out(s)} for s in snaps],
             "months": months, "transactions": [txn_out(t, user) for t in txns]}
 
 
