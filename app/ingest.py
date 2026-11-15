@@ -5,16 +5,19 @@ Linking rules (see README "How the four files are linked"):
   * PAN (processed report only) is stored on the investor and separates namesakes.
   * Folio (three transaction reports) links rejections/redemptions of namesakes back to
     the right person, using folios already seen against a PAN.
+  * The E-Wealth registration report lists every registered account with its PAN; it adds
+    not-yet-invested clients and fills in PANs for the rest.
 """
 import hashlib
 from collections import defaultdict
+from datetime import date
 from typing import Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from . import parsers
-from .models import AumSnapshot, Investor, Txn, Upload, User
+from .models import AumSnapshot, Investor, Registration, Txn, Upload, User
 
 
 class Resolver:
@@ -68,28 +71,20 @@ def _period(d) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 
-def aum_period(as_on) -> str:
-    """Month an AUM report is filed under. The reports are pulled at the start of a month
-    together with *last month's* transactions, so an "As on" date in the first half of a
-    month is treated as the closing position of the previous month. Override on upload."""
-    if as_on.day <= 15:
-        y, m = (as_on.year, as_on.month - 1) if as_on.month > 1 else (as_on.year - 1, 12)
-        return f"{y:04d}-{m:02d}"
-    return _period(as_on)
-
-
-def _ingest_aum(db: Session, parsed: dict, up: Upload, res: Resolver, period: str):
-    db.execute(delete(AumSnapshot).where(AumSnapshot.period == period))  # latest upload for a month wins
+def _ingest_aum(db: Session, parsed: dict, up: Upload, res: Resolver, as_on: date):
+    """One snapshot per exact date. Uploading the same date again replaces that date only."""
+    db.execute(delete(AumSnapshot).where(AumSnapshot.as_on == as_on))
     prev = {}
-    last = db.scalar(select(AumSnapshot.period).where(AumSnapshot.period < period).order_by(AumSnapshot.period.desc()).limit(1))
+    last = db.scalar(select(func.max(AumSnapshot.as_on)).where(AumSnapshot.as_on < as_on)) \
+        or db.scalar(select(func.min(AumSnapshot.as_on)).where(AumSnapshot.as_on > as_on))
     if last:
-        prev = {s.investor_id: float(s.inv_total) for s in db.scalars(select(AumSnapshot).where(AumSnapshot.period == last))}
+        prev = {s.investor_id: float(s.inv_total) for s in db.scalars(select(AumSnapshot).where(AumSnapshot.as_on == last))}
     groups: dict[str, list[dict]] = defaultdict(list)
     for row in parsed["rows"]:
         groups[parsers.name_key(row["name"])].append(row)
     for key, rows in groups.items():
         free = list(res.by_key[key])
-        # namesakes: pair each row with the existing investor whose last invested total is closest
+        # namesakes: pair each row with the existing investor whose nearest invested total is closest
         pairs = []
         if len(rows) > 1 and free and prev:
             for row in sorted(rows, key=lambda r: -r["inv_total"]):
@@ -106,9 +101,43 @@ def _ingest_aum(db: Session, parsed: dict, up: Upload, res: Resolver, period: st
         for row, inv in pairs:
             if row.get("group") and not inv.group_name:
                 inv.group_name = row["group"]
-            db.add(AumSnapshot(investor_id=inv.id, period=period, as_on=parsed["as_on"], upload_id=up.id,
+            db.add(AumSnapshot(investor_id=inv.id, period=_period(as_on), as_on=as_on, upload_id=up.id,
                                **{k: v for k, v in row.items() if k.startswith(("inv_", "aum_"))}))
-    up.period, up.rows_new = period, len(parsed["rows"])
+    up.period, up.as_on, up.rows_new = _period(as_on), as_on, len(parsed["rows"])
+    db.flush()
+    # history rows of AUM uploads that this one has fully replaced are no longer meaningful
+    live = select(AumSnapshot.upload_id).distinct()
+    db.execute(delete(Upload).where(Upload.report_type == parsers.AUM, Upload.id != up.id, Upload.id.not_in(live)))
+
+
+def _ingest_registrations(db: Session, parsed: dict, up: Upload, res: Resolver):
+    """Full registered-client list. Every row carries a PAN, so this also fills in PANs."""
+    rows = parsed["rows"]
+    existing = set(db.scalars(select(Registration.ref_no)))
+    pans_for: dict[str, set] = defaultdict(set)
+    for r in rows:
+        if r["pan"]:
+            pans_for[parsers.name_key(r["name"])].add(r["pan"])
+    for r in rows:
+        if r["ref"] in existing:
+            continue
+        existing.add(r["ref"])
+        key = parsers.name_key(r["name"])
+        cands = res.by_key[key]
+        hit = next((c for c in cands if r["pan"] and c.pan == r["pan"]), None)
+        if not hit:
+            blank = [c for c in cands if not c.pan]
+            unowned = pans_for[key] - {c.pan for c in cands}
+            if blank and len(unowned) > 1:
+                hit = None  # same name, several unplaced PANs, PAN-less clients on file: a person must decide
+            else:
+                hit = res.for_txn({"name": r["name"], "pan": r["pan"], "group": r.get("group")})
+        if not hit:
+            up.rows_unmatched += 1
+        db.add(Registration(ref_no=r["ref"], investor_id=hit.id if hit else None, name_key=key, account_name=r["name"],
+                            pan=r["pan"], account_type=r["account_type"], mode=r["mode"],
+                            acquired_from=r["acquired_from"], upload_id=up.id))
+        up.rows_new += 1
 
 
 def _dedupe_keys(kind: str, rows: list[dict]) -> list[str]:
@@ -149,8 +178,36 @@ def _ingest_txns(db: Session, parsed: dict, up: Upload, res: Resolver):
         up.rows_new += 1
 
 
+def link_registrations(db: Session, res: Resolver, key: Optional[str] = None) -> int:
+    """Attach registration rows that could not be placed when they were uploaded. Runs after
+    every upload and PAN edit, because a later file (or a person) may have supplied the PAN
+    that tells two namesakes apart."""
+    db.flush()
+    q = select(Registration).where(Registration.investor_id.is_(None), Registration.pan.is_not(None))
+    if key:
+        q = q.where(Registration.name_key == key)
+    todo = list(db.scalars(q.order_by(Registration.id)))
+    fixed = 0
+    for g in todo:
+        cands = res.by_key[g.name_key]
+        hit = next((c for c in cands if c.pan == g.pan), None)
+        if not hit:
+            blank = [c for c in cands if not c.pan]
+            if not blank:
+                hit = res.create(g.account_name, g.name_key, g.pan)  # every namesake has another PAN -> a new person
+            else:
+                unowned = {x.pan for x in todo if x.name_key == g.name_key} - {c.pan for c in cands}
+                if len(blank) == 1 and unowned == {g.pan}:
+                    blank[0].pan = g.pan  # the only PAN-less client and the only unplaced PAN
+                    hit = blank[0]
+        if hit:
+            g.investor_id, fixed = hit.id, fixed + 1
+    db.flush()
+    return fixed
+
+
 def relink(db: Session, key: str) -> int:
-    """Re-attach orphan transactions for a name once PANs have been set on the namesakes."""
+    """Re-attach orphan transactions and registrations for a name once PANs have been set."""
     db.flush()
     res, fixed = Resolver(db), 0
     for with_pan in (True, False):  # PAN rows first; they reveal the folios the PAN-less rows need
@@ -162,10 +219,31 @@ def relink(db: Session, key: str) -> int:
             if hit:
                 t.investor_id, fixed = hit.id, fixed + 1
         db.flush()
-    return fixed
+    return fixed + link_registrations(db, res, key)
 
 
-def ingest(db: Session, filename: str, content: bytes, user: User, period: Optional[str] = None) -> Upload:
+def purge_orphans(db: Session) -> int:
+    """Remove clients left with nothing at all (no AUM, no transactions, no registration, no agent)."""
+    db.flush()
+    q = delete(Investor).where(Investor.ra_id.is_(None),
+                               Investor.id.not_in(select(AumSnapshot.investor_id)),
+                               Investor.id.not_in(select(Txn.investor_id).where(Txn.investor_id.is_not(None))),
+                               Investor.id.not_in(select(Registration.investor_id).where(Registration.investor_id.is_not(None))))
+    return db.execute(q).rowcount or 0
+
+
+def delete_upload(db: Session, up: Upload) -> dict:
+    """Undo one upload: remove exactly the rows that file added, then any clients left empty."""
+    n = 0
+    for model in (AumSnapshot, Txn, Registration):
+        n += db.execute(delete(model).where(model.upload_id == up.id)).rowcount or 0
+    db.delete(up)
+    gone = purge_orphans(db)
+    db.commit()
+    return {"rows_removed": n, "clients_removed": gone}
+
+
+def ingest(db: Session, filename: str, content: bytes, user: User, as_on: Optional[date] = None) -> Upload:
     parsed = parsers.parse(content)
     up = Upload(report_type=parsed["type"], filename=filename[:300], title=parsed["title"][:300],
                 rows_total=len(parsed["rows"]), uploaded_by=user.id)
@@ -173,12 +251,15 @@ def ingest(db: Session, filename: str, content: bytes, user: User, period: Optio
     db.flush()
     res = Resolver(db)
     if parsed["type"] == parsers.AUM:
-        p = period or (aum_period(parsed["as_on"]) if parsed["as_on"] else None)
-        if not p:
-            raise parsers.ParseError("Could not read the 'As on' date from the AUM report - pass the month explicitly")
-        _ingest_aum(db, parsed, up, res, p)
+        d = as_on or parsed["as_on"]
+        if not d:
+            raise parsers.ParseError("Could not read the 'As on' date from the AUM report - choose the date on the upload page")
+        _ingest_aum(db, parsed, up, res, d)
+    elif parsed["type"] == parsers.REGISTRATION:
+        _ingest_registrations(db, parsed, up, res)
     else:
         _ingest_txns(db, parsed, up, res)
+    link_registrations(db, res)
     up.investors_created = res.created
     db.commit()
     return up
