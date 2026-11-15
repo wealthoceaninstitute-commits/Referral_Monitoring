@@ -53,7 +53,8 @@ class Upload(Base):
     report_type: Mapped[str] = mapped_column(String(12))
     filename: Mapped[str] = mapped_column(String(300))
     title: Mapped[Optional[str]] = mapped_column(String(300))
-    period: Mapped[Optional[str]] = mapped_column(String(7))  # AUM snapshots only
+    period: Mapped[Optional[str]] = mapped_column(String(7))  # AUM only: month of as_on
+    as_on: Mapped[Optional[date]] = mapped_column(Date)  # AUM only: the snapshot date
     rows_total: Mapped[int] = mapped_column(Integer, default=0)
     rows_new: Mapped[int] = mapped_column(Integer, default=0)
     rows_unmatched: Mapped[int] = mapped_column(Integer, default=0)
@@ -63,13 +64,14 @@ class Upload(Base):
 
 
 class AumSnapshot(Base):
-    """Month-end style position per investor, straight from the Investor Wise AUM report."""
+    """Position per investor on one exact date, straight from the Investor Wise AUM report.
+    Any number of dates can be kept; uploading the same date again replaces it."""
     __tablename__ = "aum_snapshots"
-    __table_args__ = (UniqueConstraint("investor_id", "period"),)
+    __table_args__ = (UniqueConstraint("investor_id", "as_on", name="uq_aum_investor_as_on"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     investor_id: Mapped[int] = mapped_column(ForeignKey("investors.id"), index=True)
-    period: Mapped[str] = mapped_column(String(7), index=True)  # YYYY-MM
-    as_on: Mapped[Optional[date]] = mapped_column(Date)
+    period: Mapped[str] = mapped_column(String(7), index=True)  # YYYY-MM of as_on
+    as_on: Mapped[date] = mapped_column(Date, index=True)
     upload_id: Mapped[int] = mapped_column(ForeignKey("uploads.id"))
     inv_equity: Mapped[float] = mapped_column(Money, default=0)
     inv_debt: Mapped[float] = mapped_column(Money, default=0)
@@ -110,3 +112,19 @@ class Txn(Base):
     payout_mode: Mapped[Optional[str]] = mapped_column(String(60))
     ref_no: Mapped[Optional[str]] = mapped_column(String(40))
     upload_id: Mapped[int] = mapped_column(ForeignKey("uploads.id"))
+
+
+class Registration(Base):
+    """One row per E-Wealth account from the Reg. Status report - the full registered client
+    list, including people who have not invested yet."""
+    __tablename__ = "registrations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ref_no: Mapped[str] = mapped_column(String(40), unique=True)
+    investor_id: Mapped[Optional[int]] = mapped_column(ForeignKey("investors.id"), index=True)
+    name_key: Mapped[str] = mapped_column(String(200), index=True)
+    account_name: Mapped[str] = mapped_column(String(200))
+    pan: Mapped[Optional[str]] = mapped_column(String(10))
+    account_type: Mapped[Optional[str]] = mapped_column(String(40))
+    mode: Mapped[Optional[str]] = mapped_column(String(40))
+    acquired_from: Mapped[Optional[str]] = mapped_column(String(60))
+    upload_id: Mapped[int] = mapped_column(ForeignKey("uploads.id"), index=True)
