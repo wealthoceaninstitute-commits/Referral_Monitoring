@@ -11,13 +11,14 @@ from typing import Any, Optional
 
 import openpyxl
 
-AUM, PURCHASE, REJECTION, REDEMPTION = "AUM", "PURCHASE", "REJECTION", "REDEMPTION"
+AUM, PURCHASE, REJECTION, REDEMPTION, REGISTRATION = "AUM", "PURCHASE", "REJECTION", "REDEMPTION", "REGISTRATION"
 
 TITLES = [
     ("investor wise aum report", AUM),
     ("processed transaction detail report", PURCHASE),
     ("transaction rejection report", REJECTION),
     ("mf redemption payout detail report", REDEMPTION),
+    ("e-wealth reg", REGISTRATION),
 ]
 
 
@@ -131,6 +132,23 @@ def parse(content: bytes) -> dict:
             row.update({f"aum_{c}": vals[6 + k] for k, c in enumerate(cats)})
             out.append(row)
         return {"type": AUM, "title": title, "as_on": as_on, "rows": out}
+
+    if rtype == REGISTRATION:
+        c = dict(name=_col(hdr, "accountnameasperpan", "accountname"), pan=_col(hdr, "accountholderpan"),
+                 ref=_col(hdr, "refno"), atype=_col(hdr, "accounttype"), mode=_col(hdr, "modeofoperation"),
+                 src=_col(hdr, "clientacquisitionfrom"), group=_col(hdr, "partneremployee"))
+        if c["name"] is None or c["ref"] is None:
+            raise ParseError("Registration report is missing the 'Account Name' or 'Ref No.' column")
+        out = []
+        for r in _data_rows(rows, hi + 1):
+            ref, name = text(get(r, c["ref"])), text(get(r, c["name"]))
+            if not ref or not name:
+                continue
+            pan = (text(get(r, c["pan"])) or "").upper()
+            out.append({"name": name, "pan": pan if len(pan) == 10 else None, "ref": ref,
+                        "account_type": text(get(r, c["atype"])), "mode": text(get(r, c["mode"])),
+                        "acquired_from": text(get(r, c["src"])), "group": text(get(r, c["group"]))})
+        return {"type": REGISTRATION, "title": title, "as_on": None, "rows": out}
 
     spec = {
         PURCHASE: dict(date=("purchasedate",), type=("type",), folio=("folionodemataC".lower(), "foliono"),
