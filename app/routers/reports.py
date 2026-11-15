@@ -1,11 +1,12 @@
+from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import ADMIN, MASTER, RA, AumSnapshot, Investor, Txn, User
+from ..models import ADMIN, MASTER, RA, AumSnapshot, Investor, Registration, Txn, User
 from ..scope import investor_filter, mask_pan, visible_ras
 from ..security import current_user
 
@@ -14,13 +15,28 @@ KINDS = ("PURCHASE", "REDEMPTION", "REJECTION")
 
 
 def latest_period(db: Session) -> Optional[str]:
-    return db.scalar(select(func.max(AumSnapshot.period))) or db.scalar(select(func.max(Txn.period)))
+    """Default transaction month: the latest month with completed purchases (the processed
+    report is always 'last month'), else the latest month with anything."""
+    return (db.scalar(select(func.max(Txn.period)).where(Txn.kind == "PURCHASE"))
+            or db.scalar(select(func.max(Txn.period))) or db.scalar(select(func.max(AumSnapshot.period))))
 
 
 def all_periods(db: Session) -> list[str]:
-    a = set(db.scalars(select(AumSnapshot.period).distinct()))
-    t = set(db.scalars(select(Txn.period).distinct()))
-    return sorted(a | t, reverse=True)
+    return sorted(set(db.scalars(select(Txn.period).distinct())), reverse=True)
+
+
+def aum_dates(db: Session) -> list[date]:
+    return sorted(db.scalars(select(AumSnapshot.as_on).distinct()), reverse=True)
+
+
+def pick_as_on(db: Session, as_on: Optional[str]) -> Optional[date]:
+    """The AUM snapshot to show: the requested date, else the most recent one."""
+    if as_on:
+        try:
+            return date.fromisoformat(as_on)
+        except ValueError:
+            raise HTTPException(422, "as_on must look like 2026-11-15")
+    return db.scalar(select(func.max(AumSnapshot.as_on)))
 
 
 def txn_out(t: Txn, user: User, ra_name: Optional[str] = None) -> dict:
@@ -41,7 +57,9 @@ def _flow_block(rows) -> dict:
 
 @router.get("/periods")
 def periods(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return {"periods": all_periods(db), "latest": latest_period(db)}
+    dates = aum_dates(db)
+    return {"periods": all_periods(db), "latest": latest_period(db),
+            "aum_dates": dates, "latest_aum": dates[0] if dates else None}
 
 
 @router.get("/ras")
@@ -53,37 +71,35 @@ def ras(user: User = Depends(current_user), db: Session = Depends(get_db)):
 
 
 @router.get("/dashboard")
-def dashboard(period: Optional[str] = None, ra_id: Optional[str] = None,
+def dashboard(period: Optional[str] = None, as_on: Optional[str] = None, ra_id: Optional[str] = None,
               user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """`as_on` picks the AUM snapshot (exact date); `period` picks the transaction month."""
     period = period or latest_period(db)
+    on = pick_as_on(db, as_on)
     conds = investor_filter(db, user, ra_id)  # admins: own RAs' clients + the unassigned pool
     scoped = select(Investor.id).where(*conds)
+    S = AumSnapshot
+    zero = lambda col: func.coalesce(func.sum(col), 0)  # noqa: E731
 
-    def snap_totals(p):
-        r = db.execute(select(func.count(), func.coalesce(func.sum(AumSnapshot.inv_total), 0),
-                              func.coalesce(func.sum(AumSnapshot.aum_total), 0),
-                              func.coalesce(func.sum(AumSnapshot.aum_equity), 0), func.coalesce(func.sum(AumSnapshot.aum_debt), 0),
-                              func.coalesce(func.sum(AumSnapshot.aum_hybrid), 0), func.coalesce(func.sum(AumSnapshot.aum_physical), 0),
-                              func.coalesce(func.sum(AumSnapshot.aum_others), 0))
-                       .where(AumSnapshot.period == p, AumSnapshot.investor_id.in_(scoped))).one()
-        return {"active_clients": r[0], "invested": float(r[1]), "aum": float(r[2]), "gain": float(r[2]) - float(r[1]),
-                "mix": {"equity": float(r[3]), "debt": float(r[4]), "hybrid": float(r[5]), "physical": float(r[6]), "others": float(r[7])}}
-
-    totals = snap_totals(period)
-    totals["as_on"] = db.scalar(select(func.max(AumSnapshot.as_on)).where(AumSnapshot.period == period))
+    r = db.execute(select(func.count(), zero(S.inv_total), zero(S.aum_total), zero(S.aum_equity), zero(S.aum_debt),
+                          zero(S.aum_hybrid), zero(S.aum_physical), zero(S.aum_others))
+                   .where(S.as_on == on, S.investor_id.in_(scoped))).one()
+    totals = {"as_on": on, "active_clients": r[0], "invested": float(r[1]), "aum": float(r[2]), "gain": float(r[2]) - float(r[1]),
+              "mix": {"equity": float(r[3]), "debt": float(r[4]), "hybrid": float(r[5]), "physical": float(r[6]), "others": float(r[7])}}
     totals["clients"] = db.scalar(select(func.count()).select_from(Investor).where(*conds))
+    totals["not_invested"] = totals["clients"] - totals["active_clients"]
     totals.update(_flow_block(db.execute(select(Txn.kind, func.sum(Txn.amount), func.count())
                                          .where(Txn.period == period, Txn.investor_id.in_(scoped)).group_by(Txn.kind))))
 
-    # month-wise history for the same scope
+    # every AUM snapshot on file, for the same scope
+    aum_history = [{"as_on": d, "active_clients": n, "invested": float(inv or 0), "aum": float(aum or 0)}
+                   for d, n, inv, aum in db.execute(select(S.as_on, func.count(), func.sum(S.inv_total), func.sum(S.aum_total))
+                                                    .where(S.investor_id.in_(scoped)).group_by(S.as_on).order_by(S.as_on.desc()))]
+    # month-wise transactions for the same scope
     months: dict[str, dict] = {}
-    for p, n, inv, aum in db.execute(select(AumSnapshot.period, func.count(), func.sum(AumSnapshot.inv_total), func.sum(AumSnapshot.aum_total))
-                                     .where(AumSnapshot.investor_id.in_(scoped)).group_by(AumSnapshot.period)):
-        months[p] = {"period": p, "active_clients": n, "invested": float(inv or 0), "aum": float(aum or 0)}
     for p, kind, amt, n in db.execute(select(Txn.period, Txn.kind, func.sum(Txn.amount), func.count())
                                       .where(Txn.investor_id.in_(scoped)).group_by(Txn.period, Txn.kind)):
-        m = months.setdefault(p, {"period": p, "active_clients": 0, "invested": None, "aum": None})
-        m[kind.lower()] = {"amount": float(amt or 0), "count": n}
+        months.setdefault(p, {"period": p})[kind.lower()] = {"amount": float(amt or 0), "count": n}
     for m in months.values():
         for k in KINDS:
             m.setdefault(k.lower(), {"amount": 0.0, "count": 0})
@@ -93,28 +109,34 @@ def dashboard(period: Optional[str] = None, ra_id: Optional[str] = None,
     by_ra = []
     if user.role != RA:
         team = investor_filter(db, user, None, pool=True)
+        blank = lambda: {"clients": 0, "holding": 0, "invested": 0.0, "aum": 0.0, **{k.lower(): 0.0 for k in KINDS}}  # noqa: E731
         agg: dict = {}
         for rid, n in db.execute(select(Investor.ra_id, func.count()).where(*team).group_by(Investor.ra_id)):
-            agg[rid] = {"clients": n, "invested": 0.0, "aum": 0.0, **{k.lower(): 0.0 for k in KINDS}}
-        for rid, inv, aum in db.execute(select(Investor.ra_id, func.sum(AumSnapshot.inv_total), func.sum(AumSnapshot.aum_total))
-                                        .join(AumSnapshot, AumSnapshot.investor_id == Investor.id)
-                                        .where(AumSnapshot.period == period, *team).group_by(Investor.ra_id)):
-            agg[rid].update(invested=float(inv or 0), aum=float(aum or 0))
+            agg[rid] = {**blank(), "clients": n}
+        for rid, n, inv, aum in db.execute(select(Investor.ra_id, func.count(), func.sum(S.inv_total), func.sum(S.aum_total))
+                                           .join(S, S.investor_id == Investor.id)
+                                           .where(S.as_on == on, *team).group_by(Investor.ra_id)):
+            agg[rid].update(holding=n, invested=float(inv or 0), aum=float(aum or 0))
         for rid, kind, amt in db.execute(select(Investor.ra_id, Txn.kind, func.sum(Txn.amount))
                                          .join(Txn, Txn.investor_id == Investor.id)
                                          .where(Txn.period == period, *team).group_by(Investor.ra_id, Txn.kind)):
             agg[rid][kind.lower()] = float(amt or 0)
         admins = {u.id: u.name for u in db.scalars(select(User).where(User.role == ADMIN))}
-        empty = {"clients": 0, "invested": 0.0, "aum": 0.0, **{k.lower(): 0.0 for k in KINDS}}
         for u in visible_ras(db, user):
             by_ra.append({"ra_id": u.id, "name": u.name, "admin_name": admins.get(u.parent_id), "is_active": u.is_active,
-                          **agg.get(u.id, empty)})
-        by_ra.sort(key=lambda r: -r["aum"])
+                          **agg.get(u.id, blank())})
+        by_ra.sort(key=lambda x: -x["aum"])
         if None in agg:
             by_ra.append({"ra_id": None, "name": "Unassigned", "admin_name": None, "is_active": True, **agg[None]})
+        for x in by_ra:
+            x["not_invested"] = x["clients"] - x["holding"]
 
-    unmatched = db.scalar(select(func.count()).select_from(Txn).where(Txn.investor_id.is_(None))) if user.role == MASTER else 0
-    return {"period": period, "totals": totals, "by_month": by_month, "by_ra": by_ra, "unmatched_transactions": unmatched}
+    unmatched = unmatched_regs = 0
+    if user.role == MASTER:
+        unmatched = db.scalar(select(func.count()).select_from(Txn).where(Txn.investor_id.is_(None)))
+        unmatched_regs = db.scalar(select(func.count()).select_from(Registration).where(Registration.investor_id.is_(None)))
+    return {"period": period, "as_on": on, "totals": totals, "aum_history": aum_history, "by_month": by_month,
+            "by_ra": by_ra, "unmatched_transactions": unmatched, "unmatched_registrations": unmatched_regs}
 
 
 @router.get("/transactions")
